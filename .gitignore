@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Claude Code local config
+.claude/
+
 # Generated audio and session files
 *.wav
 *.mp3
