@@ -247,6 +247,26 @@ class Project:
             if len(audio) < self.sr * 0.05:
                 continue
 
+            # --- False start detection ---
+            # If all donor takes map to near-zero duration for this segment,
+            # the base has extra material (e.g., stopped and restarted).
+            false_start = False
+            for ti, take in enumerate(self.takes):
+                if ti == self.base_idx:
+                    continue
+                donor_start = self._base_time_to_take_time(take, seg.start_time)
+                donor_end = self._base_time_to_take_time(take, seg.end_time)
+                donor_dur = donor_end - donor_start
+                base_dur = seg.end_time - seg.start_time
+                if donor_dur < base_dur * 0.1:
+                    false_start = True
+            if false_start:
+                seg_issues.append(Issue(
+                    segment_index=seg.index, issue_type="false_start",
+                    severity=1.0,
+                    description="no matching content in donor takes (likely stopped and restarted)",
+                ))
+
             # --- Clipping detection ---
             clip_ratio = np.mean(np.abs(audio) > 0.99)
             if clip_ratio > 0.001:
@@ -493,65 +513,110 @@ class Project:
         seg = self.segments[segment_index]
         print(f"Reverted {seg.label} to base take")
 
-    def export_composite(self, output_path: str, crossfade_ms: int = 50):
+    def _is_false_start_patch(self, patch: Patch) -> bool:
+        """Check if a patch is for a false_start issue (should be cut, not replaced)."""
+        return any(i.segment_index == patch.segment_index and i.issue_type == "false_start"
+                   for i in self.issues)
+
+    def export_composite(self, output_path: str = None, crossfade_ms: int = 50) -> np.ndarray:
         """Export the composite: base take with patches applied.
 
-        The output follows the base take's timing exactly. Patched segments
-        are time-stretched to fit and crossfaded at boundaries.
+        False start patches are cut out entirely. Regular patches replace
+        the base audio with time-stretched, volume-matched donor audio.
+
+        Returns the composite audio array. If output_path is given, also writes to file.
         """
         base = self.takes[self.base_idx]
-        output = base.audio.copy()
         crossfade_samples = int(crossfade_ms / 1000 * self.sr)
 
         patched_indices = {p.segment_index: p.take_index for p in self.patches}
+        cut_indices = {p.segment_index for p in self.patches if self._is_false_start_patch(p)}
+
+        # Build output as contiguous runs of base audio, with patches/cuts
+        # at specific boundaries. Only crossfade where a cut or patch actually
+        # disrupts continuity — consecutive base segments stay untouched.
+
+        # First, group segments into contiguous runs
+        # Each run is either: a span of base audio, a patched segment, or a cut
+        runs = []  # list of (type, data) where type is 'base', 'patch', 'cut'
+        base_run_start = None  # start sample of current base run
 
         for seg in self.segments:
-            if seg.index not in patched_indices:
-                continue
-
-            donor_idx = patched_indices[seg.index]
-            donor_audio = self.get_segment_audio(donor_idx, seg, match_duration=True)
-
             start_sample = int(seg.start_time * self.sr)
             end_sample = int(seg.end_time * self.sr)
-            seg_len = end_sample - start_sample
 
-            # Ensure donor audio matches segment length
-            if len(donor_audio) > seg_len:
-                donor_audio = donor_audio[:seg_len]
-            elif len(donor_audio) < seg_len:
-                donor_audio = np.pad(donor_audio, (0, seg_len - len(donor_audio)))
+            if seg.index in cut_indices:
+                # Flush any accumulated base run
+                if base_run_start is not None:
+                    runs.append(('base', base.audio[base_run_start:start_sample].copy()))
+                    base_run_start = None
+                runs.append(('cut', None))
 
-            # Match RMS level of donor to base segment
-            base_segment = output[start_sample:end_sample]
-            base_rms = np.sqrt(np.mean(base_segment**2)) + 1e-8
-            donor_rms = np.sqrt(np.mean(donor_audio**2)) + 1e-8
-            donor_audio = donor_audio * (base_rms / donor_rms)
+            elif seg.index in patched_indices:
+                # Flush base run
+                if base_run_start is not None:
+                    runs.append(('base', base.audio[base_run_start:start_sample].copy()))
+                    base_run_start = None
 
-            # Apply crossfade at patch boundaries
-            cf = min(crossfade_samples, seg_len // 4)
-            if cf > 1:
-                t = np.linspace(0, np.pi / 2, cf, dtype=np.float32)
-                fade_in = np.sin(t)
-                fade_out = np.cos(t)
-                # Fade in at start of patch
-                donor_audio[:cf] = (output[start_sample:start_sample + cf] * fade_out +
-                                    donor_audio[:cf] * fade_in)
-                # Fade out at end of patch
-                donor_audio[-cf:] = (donor_audio[-cf:] * fade_out +
-                                     output[end_sample - cf:end_sample] * fade_in)
+                donor_idx = patched_indices[seg.index]
+                chunk = self.get_segment_audio(donor_idx, seg, match_duration=True)
+                seg_len = end_sample - start_sample
 
-            output[start_sample:start_sample + len(donor_audio)] = donor_audio
+                if len(chunk) > seg_len:
+                    chunk = chunk[:seg_len]
+                elif len(chunk) < seg_len:
+                    chunk = np.pad(chunk, (0, seg_len - len(chunk)))
 
-        # Normalize
-        peak = np.max(np.abs(output))
+                # Volume-match to base
+                base_segment = base.audio[start_sample:end_sample]
+                base_rms = np.sqrt(np.mean(base_segment**2)) + 1e-8
+                chunk_rms = np.sqrt(np.mean(chunk**2)) + 1e-8
+                chunk = chunk * (base_rms / chunk_rms)
+
+                runs.append(('patch', chunk))
+
+            else:
+                # Base segment — extend or start a contiguous run
+                if base_run_start is None:
+                    base_run_start = start_sample
+
+        # Flush final base run
+        if base_run_start is not None:
+            runs.append(('base', base.audio[base_run_start:].copy()))
+
+        # Concatenate runs, crossfading only at boundaries between different runs
+        audio_runs = [r[1] for r in runs if r[0] != 'cut' and r[1] is not None]
+
+        if not audio_runs:
+            output = np.zeros(0, dtype=np.float32)
+        else:
+            output = audio_runs[0]
+            for i in range(1, len(audio_runs)):
+                chunk = audio_runs[i]
+                cf = min(crossfade_samples, len(output), len(chunk))
+                if cf > 1:
+                    t = np.linspace(0, np.pi / 2, cf, dtype=np.float32)
+                    fade_out = np.cos(t)
+                    fade_in = np.sin(t)
+                    output[-cf:] = output[-cf:] * fade_out + chunk[:cf] * fade_in
+                    output = np.concatenate([output, chunk[cf:]])
+                else:
+                    output = np.concatenate([output, chunk])
+
+        peak = np.max(np.abs(output)) if len(output) > 0 else 0
         if peak > 0.95:
             output *= 0.95 / peak
 
-        sf.write(output_path, output, self.sr)
-        print(f"\nExported composite: {output_path} ({len(output)/self.sr:.1f}s)")
-        print(f"  {len(self.patches)} segments patched, "
-              f"{len(self.segments) - len(self.patches)} from base")
+        n_cut = len(cut_indices)
+        n_patched = len(self.patches) - n_cut
+        n_base = len(self.segments) - len(self.patches)
+
+        if output_path:
+            sf.write(output_path, output, self.sr)
+            print(f"\nExported composite: {output_path} ({len(output)/self.sr:.1f}s)")
+        print(f"  {n_base} from base, {n_patched} patched, {n_cut} cut")
+
+        return output
 
     def export_segment_comparisons(self, output_dir: str, segments: list[int] = None):
         """Export specific segments from all takes for A/B listening.

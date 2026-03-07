@@ -20,6 +20,9 @@ def init_project(folder: str, base_name: str = None, beats_per_bar: int = 4,
     proj = Project(folder)
     proj.load_takes(min_duration=min_duration)
     if take_names:
+        # Always include the base take in the filter
+        if base_name and base_name not in take_names:
+            take_names.append(base_name)
         proj.takes = [t for t in proj.takes if any(n in t.name for n in take_names)]
     if base_name:
         proj.set_base(name=base_name)
@@ -142,49 +145,8 @@ def export_composite():
     """Export the composite and return it as a WAV download."""
     data = request.json or {}
     crossfade_ms = data.get("crossfade_ms", 80)
-    volume_adjust = data.get("volume_adjust", True)
 
-    base = proj.takes[proj.base_idx]
-    output = base.audio.copy()
-    crossfade_samples = int(crossfade_ms / 1000 * proj.sr)
-
-    patched_indices = {p.segment_index: p.take_index for p in proj.patches}
-
-    for seg in proj.segments:
-        if seg.index not in patched_indices:
-            continue
-        donor_idx = patched_indices[seg.index]
-        donor_audio = proj.get_segment_audio(donor_idx, seg, match_duration=True)
-
-        start_sample = int(seg.start_time * proj.sr)
-        end_sample = int(seg.end_time * proj.sr)
-        seg_len = end_sample - start_sample
-
-        if len(donor_audio) > seg_len:
-            donor_audio = donor_audio[:seg_len]
-        elif len(donor_audio) < seg_len:
-            donor_audio = np.pad(donor_audio, (0, seg_len - len(donor_audio)))
-
-        if volume_adjust:
-            base_rms = np.sqrt(np.mean(output[start_sample:end_sample]**2)) + 1e-8
-            donor_rms = np.sqrt(np.mean(donor_audio**2)) + 1e-8
-            donor_audio = donor_audio * (base_rms / donor_rms)
-
-        cf = min(crossfade_samples, seg_len // 4)
-        if cf > 1:
-            t = np.linspace(0, np.pi / 2, cf, dtype=np.float32)
-            fade_in = np.sin(t)
-            fade_out = np.cos(t)
-            donor_audio[:cf] = (output[start_sample:start_sample + cf] * fade_out +
-                                donor_audio[:cf] * fade_in)
-            donor_audio[-cf:] = (donor_audio[-cf:] * fade_out +
-                                 output[end_sample - cf:end_sample] * fade_in)
-
-        output[start_sample:start_sample + len(donor_audio)] = donor_audio
-
-    peak = np.max(np.abs(output))
-    if peak > 0.95:
-        output *= 0.95 / peak
+    output = proj.export_composite(crossfade_ms=crossfade_ms)
 
     buf = io.BytesIO()
     sf.write(buf, output, proj.sr, format='WAV')
