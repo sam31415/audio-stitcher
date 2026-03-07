@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AudioStitcher</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; padding-bottom: 80px; }
+h1 { padding: 16px 24px 8px; font-size: 20px; color: #fff; }
+
+/* Toolbar */
+.toolbar {
+  padding: 8px 24px 16px;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  border-bottom: 1px solid #333;
+}
+.toolbar label { font-size: 13px; color: #aaa; }
+.toolbar input[type=range] { width: 140px; vertical-align: middle; }
+.toolbar button {
+  padding: 6px 16px; border: none; border-radius: 4px;
+  cursor: pointer; font-size: 13px; font-weight: 600;
+}
+.btn-primary { background: #4a7fff; color: #fff; }
+.btn-primary:hover { background: #3a6fee; }
+.btn-secondary { background: #444; color: #ddd; }
+.btn-secondary:hover { background: #555; }
+.btn-success { background: #2ea043; color: #fff; }
+.btn-success:hover { background: #238636; }
+.btn-danger { background: #d32f2f; color: #fff; }
+.btn-danger:hover { background: #b71c1c; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
+/* Info bar */
+.info-bar {
+  padding: 8px 24px; font-size: 12px; color: #888;
+  display: flex; gap: 24px;
+}
+
+/* Timeline */
+.timeline-container { padding: 16px 24px; overflow-x: auto; }
+.timeline {
+  display: flex; gap: 2px; min-width: max-content;
+  height: 80px; align-items: flex-end;
+}
+.seg-block {
+  cursor: pointer; border-radius: 3px 3px 0 0;
+  display: flex; align-items: flex-end; justify-content: center;
+  font-size: 10px; color: rgba(255,255,255,0.7);
+  padding-bottom: 4px; transition: all 0.15s;
+  position: relative; min-width: 12px;
+}
+.seg-block:hover { filter: brightness(1.3); transform: translateY(-2px); }
+.seg-block.selected { outline: 2px solid #fff; outline-offset: 1px; }
+.seg-block.playing { outline: 2px solid #ffeb3b; outline-offset: 1px; }
+.seg-block.patched::after {
+  content: ''; position: absolute; top: 2px; right: 2px;
+  width: 6px; height: 6px; border-radius: 50%; background: #4a7fff;
+}
+
+/* Detail panel */
+.detail-panel {
+  margin: 0 24px; padding: 20px;
+  background: #16213e; border-radius: 8px;
+  display: none;
+}
+.detail-panel.visible { display: block; }
+.detail-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 12px;
+}
+.detail-header h2 { font-size: 16px; }
+.detail-header .time { color: #888; font-size: 13px; }
+
+.issues-list { margin-bottom: 16px; }
+.issue-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 4px 0; font-size: 13px;
+}
+.issue-type {
+  display: inline-block; padding: 2px 8px; border-radius: 3px;
+  font-size: 11px; font-weight: 600; text-transform: uppercase; min-width: 80px; text-align: center;
+}
+.issue-type.timing { background: #b8860b33; color: #daa520; }
+.issue-type.hesitation { background: #ff634733; color: #ff6347; }
+.issue-type.wrong_note { background: #ff149333; color: #ff1493; }
+.issue-type.noise { background: #8b000033; color: #cd5c5c; }
+.issue-type.clipping { background: #ff000033; color: #ff4444; }
+.severity-bar {
+  width: 60px; height: 6px; background: #333; border-radius: 3px; overflow: hidden;
+}
+.severity-fill { height: 100%; border-radius: 3px; }
+
+/* Take comparison grid */
+.take-grid { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.take-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-radius: 6px;
+  background: #1a1a2e; border: 1px solid #333;
+}
+.take-row.is-base { border-color: #2ea04366; }
+.take-row.is-active { border-color: #4a7fff; background: #4a7fff15; }
+.take-name { min-width: 120px; font-size: 13px; }
+.take-name .badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 3px;
+  margin-left: 6px; vertical-align: middle;
+}
+.badge-base { background: #2ea04333; color: #2ea043; }
+.badge-active { background: #4a7fff33; color: #4a7fff; }
+.take-actions { display: flex; gap: 6px; margin-left: auto; }
+
+/* Playback bar */
+.playback-bar {
+  padding: 12px 24px;
+  display: flex; align-items: center; gap: 12px;
+  border-top: 1px solid #333;
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: #1a1a2e; z-index: 10;
+}
+.playback-bar select {
+  background: #333; color: #e0e0e0; border: 1px solid #555;
+  padding: 6px 8px; border-radius: 4px; font-size: 13px;
+}
+#playback-position { color: #888; font-size: 13px; min-width: 100px; text-align: right; }
+#playback-slider { flex: 1; }
+</style>
+</head>
+<body>
+
+<h1>AudioStitcher</h1>
+
+<div class="toolbar">
+  <label>Auto-patch threshold:
+    <input type="range" id="threshold-slider" min="0" max="1" step="0.05" value="0.3">
+    <span id="threshold-value">0.30</span>
+  </label>
+  <button class="btn-primary" onclick="autoPatch()">Auto-patch</button>
+  <button class="btn-secondary" onclick="clearPatches()">Clear all patches</button>
+  <button class="btn-success" onclick="exportComposite()">Export composite</button>
+</div>
+
+<div class="info-bar" id="info-bar"></div>
+
+<div class="timeline-container">
+  <div class="timeline" id="timeline"></div>
+</div>
+
+<div class="detail-panel" id="detail-panel">
+  <div class="detail-header">
+    <h2 id="detail-title"></h2>
+    <span class="time" id="detail-time"></span>
+  </div>
+  <div class="issues-list" id="issues-list"></div>
+  <div id="take-grid-container"></div>
+</div>
+
+<div class="playback-bar">
+  <button class="btn-secondary" onclick="togglePlayback()" id="play-btn">Play</button>
+  <select id="playback-source"></select>
+  <input type="range" id="playback-slider" min="0" max="100" value="0" step="0.1">
+  <span id="playback-position">0:00 / 0:00</span>
+</div>
+
+<script>
+let project = null;
+let selectedSeg = null;
+let playingSeg = null;  // segment highlighted during full playback
+
+// Audio state
+let segmentAudio = null;  // for segment preview
+let fullAudio = null;     // for full take playback
+let fullAudioTakeIdx = null;
+let fullAudioIsComposite = false;
+
+async function loadProject() {
+  const resp = await fetch('/api/project');
+  project = await resp.json();
+  renderTimeline();
+  renderInfo();
+  renderPlaybackSource();
+}
+
+function renderInfo() {
+  const base = project.takes.find(t => t.is_base);
+  const patchCount = project.segments.filter(s => s.patch).length;
+  const issueCount = project.segments.filter(s => s.issues.length > 0).length;
+  document.getElementById('info-bar').innerHTML =
+    `<span>Base: <b>${base.name}</b> (${base.duration.toFixed(1)}s, ${base.tempo.toFixed(0)} BPM)</span>` +
+    `<span>Segments: <b>${project.segments.length}</b></span>` +
+    `<span>Issues: <b>${issueCount}</b></span>` +
+    `<span>Patches: <b>${patchCount}</b></span>` +
+    `<span>Takes: <b>${project.takes.length}</b></span>`;
+}
+
+function renderPlaybackSource() {
+  const sel = document.getElementById('playback-source');
+  sel.innerHTML = '<option value="composite">Composite (with patches)</option>';
+  project.takes.forEach(t => {
+    const label = t.name + (t.is_base ? ' (base)' : '');
+    sel.innerHTML += `<option value="${t.index}">${label}</option>`;
+  });
+}
+
+function severityColor(severity) {
+  if (severity === 0) return '#2ea043';
+  if (severity < 0.3) return '#5a8a3c';
+  if (severity < 0.5) return '#b8860b';
+  if (severity < 0.7) return '#e07020';
+  return '#d32f2f';
+}
+
+function renderTimeline() {
+  const tl = document.getElementById('timeline');
+  tl.innerHTML = '';
+  const maxDur = Math.max(...project.segments.map(s => s.duration));
+
+  project.segments.forEach(seg => {
+    const block = document.createElement('div');
+    let cls = 'seg-block';
+    if (seg.patch) cls += ' patched';
+    if (selectedSeg === seg.index) cls += ' selected';
+    if (playingSeg === seg.index) cls += ' playing';
+    block.className = cls;
+
+    const width = Math.max(12, (seg.duration / maxDur) * 40);
+    const height = seg.issues.length > 0 ? 20 + (seg.max_severity * 60) : 20;
+    const color = seg.issues.length > 0 ? severityColor(seg.max_severity) : '#2a4a2a';
+    block.style.width = width + 'px';
+    block.style.height = height + 'px';
+    block.style.background = color;
+    block.title = `${seg.label} (${seg.start.toFixed(1)}-${seg.end.toFixed(1)}s)` +
+                  (seg.issues.length ? '\n' + seg.issues.map(i => i.type + ': ' + i.description).join('\n') : '') +
+                  (seg.patch ? '\nPatched: ' + project.takes[seg.patch.take_index].name : '');
+    block.textContent = seg.index;
+    block.onclick = () => selectSegment(seg.index);
+    block.id = 'seg-' + seg.index;
+    tl.appendChild(block);
+  });
+}
+
+function selectSegment(idx) {
+  selectedSeg = idx;
+  renderTimeline();
+  renderDetail(idx);
+  // Scroll the segment into view
+  const el = document.getElementById('seg-' + idx);
+  if (el) el.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+}
+
+function renderDetail(idx) {
+  const seg = project.segments[idx];
+  const panel = document.getElementById('detail-panel');
+  panel.classList.add('visible');
+
+  document.getElementById('detail-title').textContent = seg.label;
+  document.getElementById('detail-time').textContent =
+    `${seg.start.toFixed(2)}s - ${seg.end.toFixed(2)}s (${seg.duration.toFixed(2)}s)`;
+
+  // Issues
+  const issuesEl = document.getElementById('issues-list');
+  if (seg.issues.length === 0) {
+    issuesEl.innerHTML = '<div style="color:#666;font-size:13px;margin-bottom:8px">No issues detected in this segment</div>';
+  } else {
+    issuesEl.innerHTML = seg.issues.map(issue => {
+      const sevPct = (issue.severity * 100).toFixed(0);
+      const color = severityColor(issue.severity);
+      return `<div class="issue-row">
+        <span class="issue-type ${issue.type}">${issue.type}</span>
+        <div class="severity-bar"><div class="severity-fill" style="width:${sevPct}%;background:${color}"></div></div>
+        <span>${issue.description}</span>
+      </div>`;
+    }).join('');
+  }
+
+  // Take grid: each take as a row with listen + use/revert
+  const activeTake = seg.patch ? seg.patch.take_index : project.base_idx;
+  const container = document.getElementById('take-grid-container');
+  container.innerHTML = '<div class="take-grid">' + project.takes.map(take => {
+    const isBase = take.is_base;
+    const isActive = take.index === activeTake;
+    let cls = 'take-row';
+    if (isBase) cls += ' is-base';
+    if (isActive) cls += ' is-active';
+
+    let badges = '';
+    if (isBase) badges += '<span class="badge badge-base">BASE</span>';
+    if (isActive) badges += '<span class="badge badge-active">ACTIVE</span>';
+
+    let actionBtn = '';
+    if (isActive && !isBase) {
+      // Currently patched with this take — offer revert
+      actionBtn = `<button class="btn-danger btn-sm" onclick="removePatch(${idx})">Revert to base</button>`;
+    } else if (!isActive) {
+      // Offer to use this take
+      actionBtn = `<button class="btn-primary btn-sm" onclick="setPatch(${idx}, ${take.index})">Use this</button>`;
+    }
+
+    return `<div class="${cls}">
+      <span class="take-name">${take.name}${badges}</span>
+      <button class="btn-secondary btn-sm" onclick="playSegment(${idx}, ${take.index})">Listen</button>
+      ${actionBtn}
+    </div>`;
+  }).join('') + '</div>';
+}
+
+// --- Segment audio preview ---
+function playSegment(segIdx, takeIdx) {
+  if (segmentAudio) { segmentAudio.pause(); segmentAudio = null; }
+  segmentAudio = new Audio(`/api/audio/segment/${segIdx}/${takeIdx}`);
+  segmentAudio.play();
+}
+
+// --- Patch management ---
+async function setPatch(segIdx, takeIdx) {
+  await fetch('/api/patch', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({segment_index: segIdx, take_index: takeIdx}),
+  });
+  invalidateFullAudio();
+  await loadProject();
+  selectSegment(segIdx);
+}
+
+async function removePatch(segIdx) {
+  await fetch('/api/patch', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({segment_index: segIdx, remove: true}),
+  });
+  invalidateFullAudio();
+  await loadProject();
+  selectSegment(segIdx);
+}
+
+async function autoPatch() {
+  const threshold = parseFloat(document.getElementById('threshold-slider').value);
+  await fetch('/api/auto_patch', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({min_severity: threshold}),
+  });
+  invalidateFullAudio();
+  await loadProject();
+  if (selectedSeg !== null) selectSegment(selectedSeg);
+}
+
+async function clearPatches() {
+  for (const seg of project.segments) {
+    if (seg.patch) {
+      await fetch('/api/patch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({segment_index: seg.index, remove: true}),
+      });
+    }
+  }
+  invalidateFullAudio();
+  await loadProject();
+  if (selectedSeg !== null) selectSegment(selectedSeg);
+}
+
+// --- Full playback ---
+function invalidateFullAudio() {
+  // When patches change, the composite audio cache is stale
+  if (fullAudioIsComposite && fullAudio) {
+    fullAudio.pause();
+    fullAudio = null;
+    fullAudioTakeIdx = null;
+    fullAudioIsComposite = false;
+    document.getElementById('play-btn').textContent = 'Play';
+  }
+}
+
+async function togglePlayback() {
+  const btn = document.getElementById('play-btn');
+  const sourceEl = document.getElementById('playback-source');
+  const sourceVal = sourceEl.value;
+
+  // If already playing, pause
+  if (fullAudio && !fullAudio.paused) {
+    fullAudio.pause();
+    btn.textContent = 'Play';
+    return;
+  }
+
+  // Determine what to play
+  const isComposite = sourceVal === 'composite';
+  const takeIdx = isComposite ? null : parseInt(sourceVal);
+
+  // Need to load new audio?
+  const needReload = !fullAudio ||
+    (isComposite && !fullAudioIsComposite) ||
+    (!isComposite && (fullAudioIsComposite || fullAudioTakeIdx !== takeIdx));
+
+  if (needReload) {
+    btn.textContent = 'Loading...';
+    let resp;
+    if (isComposite) {
+      resp = await fetch('/api/export', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({crossfade_ms: 80}),
+      });
+    } else {
+      resp = await fetch(`/api/audio/full/${takeIdx}`);
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+
+    if (fullAudio) { fullAudio.pause(); }
+    fullAudio = new Audio(url);
+    fullAudioTakeIdx = takeIdx;
+    fullAudioIsComposite = isComposite;
+    fullAudio.addEventListener('timeupdate', onPlaybackTimeUpdate);
+    fullAudio.addEventListener('ended', () => {
+      btn.textContent = 'Play';
+      playingSeg = null;
+      renderTimeline();
+    });
+  }
+
+  fullAudio.play();
+  btn.textContent = 'Pause';
+}
+
+function onPlaybackTimeUpdate() {
+  if (!fullAudio) return;
+  const slider = document.getElementById('playback-slider');
+  const pos = document.getElementById('playback-position');
+  const pct = (fullAudio.currentTime / fullAudio.duration) * 100;
+  slider.value = pct;
+  pos.textContent = `${formatTime(fullAudio.currentTime)} / ${formatTime(fullAudio.duration)}`;
+
+  // For take playback, map time to segment.
+  // For composite, time matches base take directly.
+  const curTime = fullAudio.currentTime;
+  const seg = project.segments.find(s => curTime >= s.start && curTime < s.end);
+  const newPlayingSeg = seg ? seg.index : null;
+  if (newPlayingSeg !== playingSeg) {
+    playingSeg = newPlayingSeg;
+    renderTimeline();
+    // Auto-show detail but don't override manual selection
+  }
+}
+
+document.getElementById('playback-slider').addEventListener('input', (e) => {
+  if (fullAudio && fullAudio.duration) {
+    fullAudio.currentTime = (e.target.value / 100) * fullAudio.duration;
+  }
+});
+
+// Clicking a segment during playback seeks to it
+function seekToSegment(idx) {
+  if (fullAudio && !fullAudio.paused) {
+    const seg = project.segments[idx];
+    fullAudio.currentTime = seg.start;
+  }
+}
+
+// --- Export ---
+async function exportComposite() {
+  const btn = document.querySelector('.btn-success');
+  btn.textContent = 'Exporting...';
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/export', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({crossfade_ms: 80}),
+    });
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'composite.wav'; a.click();
+    URL.revokeObjectURL(url);
+  } finally {
+    btn.textContent = 'Export composite';
+    btn.disabled = false;
+  }
+}
+
+// --- Utilities ---
+function formatTime(s) {
+  if (!s || isNaN(s)) return '0:00';
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+document.getElementById('threshold-slider').addEventListener('input', (e) => {
+  document.getElementById('threshold-value').textContent = parseFloat(e.target.value).toFixed(2);
+});
+
+// --- Keyboard shortcuts ---
+document.addEventListener('keydown', (e) => {
+  // Don't capture if focus is on an input
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+
+  if (e.key === 'ArrowRight' && selectedSeg !== null && selectedSeg < project.segments.length - 1) {
+    e.preventDefault();
+    selectSegment(selectedSeg + 1);
+  } else if (e.key === 'ArrowLeft' && selectedSeg !== null && selectedSeg > 0) {
+    e.preventDefault();
+    selectSegment(selectedSeg - 1);
+  } else if (e.key === ' ') {
+    e.preventDefault();
+    if (selectedSeg !== null) {
+      // Play selected segment from base
+      playSegment(selectedSeg, project.base_idx);
+    }
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    togglePlayback();
+  }
+});
+
+loadProject();
+</script>
+</body>
+</html>
