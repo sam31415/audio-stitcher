@@ -32,6 +32,7 @@ def init_project(folder: str, base_name: str = None, beats_per_bar: int = 4,
     proj.align_takes()
     proj.segment_by_bars(beats_per_bar=beats_per_bar)
     proj.diagnose()
+    proj.realign_takes()
 
 
 @app.route("/")

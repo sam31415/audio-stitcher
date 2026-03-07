@@ -513,10 +513,57 @@ class Project:
         seg = self.segments[segment_index]
         print(f"Reverted {seg.label} to base take")
 
-    def _is_false_start_patch(self, patch: Patch) -> bool:
-        """Check if a patch is for a false_start issue (should be cut, not replaced)."""
-        return any(i.segment_index == patch.segment_index and i.issue_type == "false_start"
+    def _is_false_start_segment(self, seg_index: int) -> bool:
+        """Check if a segment has a false_start issue."""
+        return any(i.segment_index == seg_index and i.issue_type == "false_start"
                    for i in self.issues)
+
+    def realign_takes(self):
+        """Re-align takes using cleaned base chroma (false start regions removed).
+
+        After diagnose() identifies false starts, the DTW warping paths are
+        distorted near those regions because the base has extra material that
+        doesn't exist in donor takes. This method re-runs DTW with the false
+        start frames excluded, giving accurate alignment for surrounding segments.
+        """
+        false_start_segs = [seg for seg in self.segments
+                            if self._is_false_start_segment(seg.index)]
+        if not false_start_segs:
+            return  # No false starts, alignment is fine
+
+        print("\nRe-aligning takes with false start regions excluded...")
+        base = self.takes[self.base_idx]
+        hop_length = 512
+        n_frames = base.chroma.shape[1]
+
+        # Build mask: True = keep, False = false start region
+        keep_mask = np.ones(n_frames, dtype=bool)
+        for seg in false_start_segs:
+            start_frame = int(seg.start_time * self.sr / hop_length)
+            end_frame = int(seg.end_time * self.sr / hop_length)
+            keep_mask[start_frame:min(end_frame, n_frames)] = False
+
+        n_removed = np.sum(~keep_mask)
+        print(f"  Excluded {n_removed} frames ({n_removed * hop_length / self.sr:.2f}s) "
+              f"from {len(false_start_segs)} false start segment(s)")
+
+        clean_chroma = base.chroma[:, keep_mask]
+        # Mapping from clean frame index back to original base frame index
+        clean_to_orig = np.where(keep_mask)[0]
+
+        for i, take in enumerate(self.takes):
+            if i == self.base_idx:
+                continue
+            D, wp = dtw(X=clean_chroma, Y=take.chroma, subseq=True)
+            clean_ref = wp[::-1, 0]
+            take_frames = wp[::-1, 1]
+
+            # Convert clean-space ref frames back to original base frame space
+            take.warp_ref_frames = clean_to_orig[clean_ref]
+            take.warp_take_frames = take_frames
+
+            mean_cost = D[wp[-1, 0], wp[-1, 1]] / len(wp)
+            print(f"  {take.name}: {len(wp)} warping points, mean DTW cost={mean_cost:.4f}")
 
     def export_composite(self, output_path: str = None, crossfade_ms: int = 50) -> np.ndarray:
         """Export the composite: base take with patches applied.
@@ -530,61 +577,106 @@ class Project:
         crossfade_samples = int(crossfade_ms / 1000 * self.sr)
 
         patched_indices = {p.segment_index: p.take_index for p in self.patches}
-        cut_indices = {p.segment_index for p in self.patches if self._is_false_start_patch(p)}
+        # Cut false_start segments only if they have no patch (or patch is
+        # the auto-generated one from the false_start issue itself).
+        # If the user explicitly patches a false_start segment with a donor,
+        # use the donor audio instead of cutting.
+        false_start_segs = {i.segment_index for i in self.issues if i.issue_type == "false_start"}
+        cut_indices = set()
+        for seg_idx in false_start_segs:
+            if seg_idx not in patched_indices:
+                # Not patched at all — cut it
+                cut_indices.add(seg_idx)
+            else:
+                # Check if the patch was auto-generated from the false_start
+                patch = next(p for p in self.patches if p.segment_index == seg_idx)
+                if "false_start" in patch.reason:
+                    cut_indices.add(seg_idx)
+                # Otherwise it's a manual/different patch — use donor audio
 
-        # Build output as contiguous runs of base audio, with patches/cuts
-        # at specific boundaries. Only crossfade where a cut or patch actually
-        # disrupts continuity — consecutive base segments stay untouched.
+        # Build output as contiguous runs. Consecutive segments from the
+        # same source (base, or same donor take) are merged into one run
+        # with no crossfade. Crossfades only happen where the source changes.
 
-        # First, group segments into contiguous runs
-        # Each run is either: a span of base audio, a patched segment, or a cut
-        runs = []  # list of (type, data) where type is 'base', 'patch', 'cut'
-        base_run_start = None  # start sample of current base run
+        # Each run: (source_id, audio_chunks_list)
+        # source_id: 'base', 'cut', or donor take index
+        runs = []  # list of (source_id, np.ndarray or None)
+        current_source = None
+        current_chunks = []
+        base_run_start = None
 
+        def flush_base_run(up_to_sample):
+            nonlocal base_run_start
+            if base_run_start is not None:
+                current_chunks.append(base.audio[base_run_start:up_to_sample].copy())
+                base_run_start = None
+
+        def flush_current_run():
+            nonlocal current_source, current_chunks
+            if current_chunks:
+                runs.append((current_source, np.concatenate(current_chunks)))
+            current_source = None
+            current_chunks = []
+
+        # First pass: group consecutive segments by source
+        groups = []  # list of (source, [seg, seg, ...])
         for seg in self.segments:
-            start_sample = int(seg.start_time * self.sr)
-            end_sample = int(seg.end_time * self.sr)
-
             if seg.index in cut_indices:
-                # Flush any accumulated base run
-                if base_run_start is not None:
-                    runs.append(('base', base.audio[base_run_start:start_sample].copy()))
-                    base_run_start = None
-                runs.append(('cut', None))
-
+                groups.append(('cut', [seg]))
             elif seg.index in patched_indices:
-                # Flush base run
-                if base_run_start is not None:
-                    runs.append(('base', base.audio[base_run_start:start_sample].copy()))
-                    base_run_start = None
-
                 donor_idx = patched_indices[seg.index]
-                chunk = self.get_segment_audio(donor_idx, seg, match_duration=True)
-                seg_len = end_sample - start_sample
+                if groups and groups[-1][0] == donor_idx:
+                    groups[-1][1].append(seg)
+                else:
+                    groups.append((donor_idx, [seg]))
+            else:
+                if groups and groups[-1][0] == 'base':
+                    groups[-1][1].append(seg)
+                else:
+                    groups.append(('base', [seg]))
 
-                if len(chunk) > seg_len:
-                    chunk = chunk[:seg_len]
-                elif len(chunk) < seg_len:
-                    chunk = np.pad(chunk, (0, seg_len - len(chunk)))
+        # Second pass: extract audio for each group
+        for source, segs in groups:
+            if source == 'cut':
+                runs.append(('cut', None))
+                continue
 
-                # Volume-match to base
-                base_segment = base.audio[start_sample:end_sample]
-                base_rms = np.sqrt(np.mean(base_segment**2)) + 1e-8
-                chunk_rms = np.sqrt(np.mean(chunk**2)) + 1e-8
-                chunk = chunk * (base_rms / chunk_rms)
-
-                runs.append(('patch', chunk))
+            if source == 'base':
+                start_sample = int(segs[0].start_time * self.sr)
+                end_sample = int(segs[-1].end_time * self.sr)
+                end_sample = min(end_sample, len(base.audio))
+                runs.append(('base', base.audio[start_sample:end_sample].copy()))
 
             else:
-                # Base segment — extend or start a contiguous run
-                if base_run_start is None:
-                    base_run_start = start_sample
+                # Donor: extract as one contiguous block using DTW endpoints
+                donor_idx = source
+                take = self.takes[donor_idx]
+                first_seg = segs[0]
+                last_seg = segs[-1]
 
-        # Flush final base run
-        if base_run_start is not None:
-            runs.append(('base', base.audio[base_run_start:].copy()))
+                donor_start = self._base_time_to_take_time(take, first_seg.start_time)
+                donor_end = self._base_time_to_take_time(take, last_seg.end_time)
 
-        # Concatenate runs, crossfading only at boundaries between different runs
+                start_sample = max(0, int(donor_start * self.sr))
+                end_sample = min(len(take.audio), int(donor_end * self.sr))
+
+                if start_sample < end_sample:
+                    chunk = take.audio[start_sample:end_sample].copy()
+
+                    # Volume-match to corresponding base span
+                    base_start = int(first_seg.start_time * self.sr)
+                    base_end = int(last_seg.end_time * self.sr)
+                    base_end = min(base_end, len(base.audio))
+                    base_span = base.audio[base_start:base_end]
+                    base_rms = np.sqrt(np.mean(base_span**2)) + 1e-8
+                    chunk_rms = np.sqrt(np.mean(chunk**2)) + 1e-8
+                    chunk = chunk * (base_rms / chunk_rms)
+
+                    runs.append((donor_idx, chunk))
+                else:
+                    runs.append((donor_idx, np.zeros(0, dtype=np.float32)))
+
+        # Concatenate runs, crossfading only at boundaries between runs
         audio_runs = [r[1] for r in runs if r[0] != 'cut' and r[1] is not None]
 
         if not audio_runs:
@@ -694,4 +786,5 @@ def run_project(folder: str, base_name: str = None, beats_per_bar: int = 4,
     proj.align_takes()
     proj.segment_by_bars(beats_per_bar=beats_per_bar)
     proj.diagnose()
+    proj.realign_takes()
     return proj
