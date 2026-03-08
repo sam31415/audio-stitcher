@@ -51,7 +51,16 @@ h1 { padding: 16px 24px 8px; font-size: 20px; color: #fff; }
 }
 .seg-block:hover { filter: brightness(1.3); transform: translateY(-2px); }
 .seg-block.selected { outline: 2px solid #fff; outline-offset: 1px; }
+.seg-block.in-range { outline: 2px solid #888; outline-offset: 1px; }
 .seg-block.playing { outline: 2px solid #ffeb3b; outline-offset: 1px; }
+.seg-block.cut {
+  background: #333 !important; opacity: 0.5;
+  border: 1px dashed #9c27b0;
+}
+.seg-block.cut::after {
+  content: ''; position: absolute; top: 2px; right: 2px;
+  width: 6px; height: 6px; border-radius: 50%; background: #9c27b0;
+}
 .seg-block.patched::after {
   content: ''; position: absolute; top: 2px; right: 2px;
   width: 6px; height: 6px; border-radius: 50%; background: #4a7fff;
@@ -163,8 +172,9 @@ h1 { padding: 16px 24px 8px; font-size: 20px; color: #fff; }
 
 <script>
 let project = null;
-let selectedSeg = null;
-let playingSeg = null;  // segment highlighted during full playback
+let selectedSeg = null;    // primary selected segment (end of range)
+let rangeStart = null;     // start of multi-select range (null = single selection)
+let playingSeg = null;     // segment highlighted during full playback
 
 // Audio state
 let segmentAudio = null;  // for segment preview
@@ -214,57 +224,102 @@ function renderTimeline() {
   tl.innerHTML = '';
   const maxDur = Math.max(...project.segments.map(s => s.duration));
 
+  const rStart = getSelectionStart();
+  const rEnd = getSelectionEnd();
+
   project.segments.forEach(seg => {
     const block = document.createElement('div');
     let cls = 'seg-block';
-    if (seg.patch) cls += ' patched';
-    if (selectedSeg === seg.index) cls += ' selected';
+    if (seg.cut) cls += ' cut';
+    else if (seg.patch) cls += ' patched';
+    if (seg.index === selectedSeg) cls += ' selected';
+    else if (rStart !== null && seg.index >= rStart && seg.index <= rEnd) cls += ' in-range';
     if (playingSeg === seg.index) cls += ' playing';
     block.className = cls;
 
     const width = Math.max(12, (seg.duration / maxDur) * 40);
-    const height = seg.issues.length > 0 ? 20 + (seg.max_severity * 60) : 20;
-    const color = seg.issues.length > 0 ? severityColor(seg.max_severity) : '#2a4a2a';
+    const height = seg.cut ? 20 : (seg.issues.length > 0 ? 20 + (seg.max_severity * 60) : 20);
+    const color = seg.cut ? '#333' : (seg.issues.length > 0 ? severityColor(seg.max_severity) : '#2a4a2a');
     block.style.width = width + 'px';
     block.style.height = height + 'px';
     block.style.background = color;
-    block.title = `${seg.label} (${seg.start.toFixed(1)}-${seg.end.toFixed(1)}s)` +
-                  (seg.issues.length ? '\n' + seg.issues.map(i => i.type + ': ' + i.description).join('\n') : '') +
-                  (seg.patch ? '\nPatched: ' + project.takes[seg.patch.take_index].name : '');
+    block.title = seg.cut
+      ? `${seg.label} (CUT - false start)`
+      : `${seg.label} (${seg.start.toFixed(1)}-${seg.end.toFixed(1)}s)` +
+        (seg.issues.length ? '\n' + seg.issues.map(i => i.type + ': ' + i.description).join('\n') : '') +
+        (seg.patch ? '\nPatched: ' + project.takes[seg.patch.take_index].name : '');
     block.textContent = seg.index;
-    block.onclick = () => selectSegment(seg.index);
+    block.onclick = (e) => selectSegment(seg.index, e.shiftKey);
     block.id = 'seg-' + seg.index;
     tl.appendChild(block);
   });
 }
 
-function selectSegment(idx) {
-  selectedSeg = idx;
+function getSelectionStart() {
+  if (rangeStart === null) return selectedSeg;
+  return Math.min(rangeStart, selectedSeg);
+}
+
+function getSelectionEnd() {
+  if (rangeStart === null) return selectedSeg;
+  return Math.max(rangeStart, selectedSeg);
+}
+
+function isRangeSelection() {
+  return rangeStart !== null && rangeStart !== selectedSeg;
+}
+
+function selectSegment(idx, shiftKey) {
+  if (shiftKey && selectedSeg !== null) {
+    // Extend range from the anchor (rangeStart or previous selectedSeg)
+    if (rangeStart === null) rangeStart = selectedSeg;
+    selectedSeg = idx;
+  } else {
+    // Single selection
+    rangeStart = null;
+    selectedSeg = idx;
+  }
   renderTimeline();
-  renderDetail(idx);
-  // Scroll the segment into view
+  renderDetail();
   const el = document.getElementById('seg-' + idx);
   if (el) el.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
 }
 
-function renderDetail(idx) {
-  const seg = project.segments[idx];
+function renderDetail() {
+  if (selectedSeg === null) return;
   const panel = document.getElementById('detail-panel');
   panel.classList.add('visible');
 
-  document.getElementById('detail-title').textContent = seg.label;
-  document.getElementById('detail-time').textContent =
-    `${seg.start.toFixed(2)}s - ${seg.end.toFixed(2)}s (${seg.duration.toFixed(2)}s)`;
+  const rStart = getSelectionStart();
+  const rEnd = getSelectionEnd();
+  const isRange = isRangeSelection();
+  const segs = project.segments.filter(s => s.index >= rStart && s.index <= rEnd);
+  const firstSeg = segs[0];
+  const lastSeg = segs[segs.length - 1];
+  const totalDuration = lastSeg.end - firstSeg.start;
 
-  // Issues
-  const issuesEl = document.getElementById('issues-list');
-  if (seg.issues.length === 0) {
-    issuesEl.innerHTML = '<div style="color:#666;font-size:13px;margin-bottom:8px">No issues detected in this segment</div>';
+  // Header
+  if (isRange) {
+    document.getElementById('detail-title').textContent =
+      `${firstSeg.label} - ${lastSeg.label} (${segs.length} segments)`;
   } else {
-    issuesEl.innerHTML = seg.issues.map(issue => {
+    document.getElementById('detail-title').textContent = firstSeg.label;
+  }
+  document.getElementById('detail-time').textContent =
+    `${firstSeg.start.toFixed(2)}s - ${lastSeg.end.toFixed(2)}s (${totalDuration.toFixed(2)}s)`;
+
+  // Issues (collect from all segments in range)
+  const allIssues = segs.flatMap(s => s.issues.map(i => ({...i, segLabel: s.label})));
+  const issuesEl = document.getElementById('issues-list');
+  if (allIssues.length === 0) {
+    issuesEl.innerHTML = '<div style="color:#666;font-size:13px;margin-bottom:8px">No issues detected</div>';
+  } else {
+    issuesEl.innerHTML = allIssues.map(issue => {
       const sevPct = (issue.severity * 100).toFixed(0);
       const color = severityColor(issue.severity);
+      const prefix = isRange ? `<span style="color:#888;font-size:11px">${issue.segLabel}</span> ` : '';
       return `<div class="issue-row">
+        ${prefix}
         <span class="issue-type ${issue.type}">${issue.type}</span>
         <div class="severity-bar"><div class="severity-fill" style="width:${sevPct}%;background:${color}"></div></div>
         <span>${issue.description}</span>
@@ -272,65 +327,76 @@ function renderDetail(idx) {
     }).join('');
   }
 
-  // Take grid: each take as a row with listen + use/revert
-  const activeTake = seg.patch ? seg.patch.take_index : project.base_idx;
+  // Take grid — only for non-cut segments
   const container = document.getElementById('take-grid-container');
-  container.innerHTML = '<div class="take-grid">' + project.takes.map(take => {
-    const isBase = take.is_base;
-    const isActive = take.index === activeTake;
-    let cls = 'take-row';
-    if (isBase) cls += ' is-base';
-    if (isActive) cls += ' is-active';
+  const patchableSegs = segs.filter(s => !s.cut);
+  if (patchableSegs.length === 0) {
+    container.innerHTML = '<div style="color:#9c27b0;font-size:13px;margin-top:12px">' +
+      'This segment is a false start and will be cut from the composite.</div>';
+  } else {
+    // For range patching, use the full range but patching only applies to non-cut segments
+    const pStart = patchableSegs[0].index;
+    const pEnd = patchableSegs[patchableSegs.length - 1].index;
+    container.innerHTML = '<div class="take-grid">' + project.takes.map(take => {
+      const isBase = take.is_base;
+      const allUseThis = patchableSegs.every(s =>
+        (take.index === project.base_idx && !s.patch) ||
+        (s.patch && s.patch.take_index === take.index));
+      let cls = 'take-row';
+      if (isBase) cls += ' is-base';
+      if (allUseThis) cls += ' is-active';
 
-    let badges = '';
-    if (isBase) badges += '<span class="badge badge-base">BASE</span>';
-    if (isActive) badges += '<span class="badge badge-active">ACTIVE</span>';
+      let badges = '';
+      if (isBase) badges += '<span class="badge badge-base">BASE</span>';
+      if (allUseThis) badges += '<span class="badge badge-active">ACTIVE</span>';
 
-    let actionBtn = '';
-    if (isActive && !isBase) {
-      // Currently patched with this take — offer revert
-      actionBtn = `<button class="btn-danger btn-sm" onclick="removePatch(${idx})">Revert to base</button>`;
-    } else if (!isActive) {
-      // Offer to use this take
-      actionBtn = `<button class="btn-primary btn-sm" onclick="setPatch(${idx}, ${take.index})">Use this</button>`;
-    }
+      let actionBtn = '';
+      if (allUseThis && !isBase) {
+        actionBtn = `<button class="btn-danger btn-sm" onclick="removePatchRange(${pStart}, ${pEnd})">Revert to base</button>`;
+      } else if (!allUseThis) {
+        actionBtn = `<button class="btn-primary btn-sm" onclick="setPatchRange(${pStart}, ${pEnd}, ${take.index})">Use this</button>`;
+      }
 
-    return `<div class="${cls}">
-      <span class="take-name">${take.name}${badges}</span>
-      <button class="btn-secondary btn-sm" onclick="playSegment(${idx}, ${take.index})">Listen</button>
-      ${actionBtn}
-    </div>`;
-  }).join('') + '</div>';
+      return `<div class="${cls}">
+        <span class="take-name">${take.name}${badges}</span>
+        <button class="btn-secondary btn-sm" onclick="playRange(${pStart}, ${pEnd}, ${take.index})">Listen</button>
+        ${actionBtn}
+      </div>`;
+    }).join('') + '</div>';
+  }
 }
 
-// --- Segment audio preview ---
-function playSegment(segIdx, takeIdx) {
+// --- Audio preview (single segment or range) ---
+function playRange(startSeg, endSeg, takeIdx) {
   if (segmentAudio) { segmentAudio.pause(); segmentAudio = null; }
-  segmentAudio = new Audio(`/api/audio/segment/${segIdx}/${takeIdx}`);
+  const url = startSeg === endSeg
+    ? `/api/audio/segment/${startSeg}/${takeIdx}`
+    : `/api/audio/range/${startSeg}/${endSeg}/${takeIdx}`;
+  segmentAudio = new Audio(url);
   segmentAudio.play();
 }
 
-// --- Patch management ---
-async function setPatch(segIdx, takeIdx) {
-  await fetch('/api/patch', {
+// --- Patch management (works for single or range) ---
+async function setPatchRange(startSeg, endSeg, takeIdx) {
+  await fetch('/api/patch_range', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({segment_index: segIdx, take_index: takeIdx}),
+    body: JSON.stringify({start_segment: startSeg, end_segment: endSeg, take_index: takeIdx}),
   });
   invalidateFullAudio();
   await loadProject();
-  selectSegment(segIdx);
+  renderDetail();
 }
 
-async function removePatch(segIdx) {
-  await fetch('/api/patch', {
+async function removePatchRange(startSeg, endSeg) {
+  await fetch('/api/patch_range', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({segment_index: segIdx, remove: true}),
+    body: JSON.stringify({start_segment: startSeg, end_segment: endSeg, remove: true}),
   });
   invalidateFullAudio();
   await loadProject();
-  selectSegment(segIdx);
+  renderDetail();
 }
 
 async function autoPatch() {
@@ -342,22 +408,19 @@ async function autoPatch() {
   });
   invalidateFullAudio();
   await loadProject();
-  if (selectedSeg !== null) selectSegment(selectedSeg);
+  if (selectedSeg !== null) renderDetail();
 }
 
 async function clearPatches() {
-  for (const seg of project.segments) {
-    if (seg.patch) {
-      await fetch('/api/patch', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({segment_index: seg.index, remove: true}),
-      });
-    }
-  }
+  const lastSeg = project.segments[project.segments.length - 1].index;
+  await fetch('/api/patch_range', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({start_segment: 0, end_segment: lastSeg, remove: true}),
+  });
   invalidateFullAudio();
   await loadProject();
-  if (selectedSeg !== null) selectSegment(selectedSeg);
+  if (selectedSeg !== null) renderDetail();
 }
 
 // --- Full playback ---
@@ -499,15 +562,14 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'ArrowRight' && selectedSeg !== null && selectedSeg < project.segments.length - 1) {
     e.preventDefault();
-    selectSegment(selectedSeg + 1);
+    selectSegment(selectedSeg + 1, e.shiftKey);
   } else if (e.key === 'ArrowLeft' && selectedSeg !== null && selectedSeg > 0) {
     e.preventDefault();
-    selectSegment(selectedSeg - 1);
+    selectSegment(selectedSeg - 1, e.shiftKey);
   } else if (e.key === ' ') {
     e.preventDefault();
     if (selectedSeg !== null) {
-      // Play selected segment from base
-      playSegment(selectedSeg, project.base_idx);
+      playRange(getSelectionStart(), getSelectionEnd(), project.base_idx);
     }
   } else if (e.key === 'Enter') {
     e.preventDefault();

@@ -39,6 +39,7 @@ class Segment:
     start_time: float  # in base take time
     end_time: float
     label: str = ""
+    cut: bool = False  # True for false starts — auto-excluded from composite
 
 
 @dataclass
@@ -168,14 +169,16 @@ class Project:
               f"{np.mean([s.end_time - s.start_time for s in self.segments]):.2f}s")
 
     def _base_time_to_take_time(self, take: Take, base_time: float) -> float:
-        """Convert a time in the base take to the corresponding time in another take."""
+        """Convert a time in the base take to the corresponding time in another take.
+
+        Uses linear interpolation on the DTW warping path for sub-frame accuracy.
+        """
         if take.warp_ref_frames is None:
             return base_time
         hop_length = 512
-        ref_frame = int(base_time * self.sr / hop_length)
-        idx = np.searchsorted(take.warp_ref_frames, ref_frame)
-        idx = np.clip(idx, 0, len(take.warp_take_frames) - 1)
-        take_frame = take.warp_take_frames[idx]
+        ref_frame = base_time * self.sr / hop_length  # float, not int
+        # Interpolate: find the donor frame corresponding to this base frame
+        take_frame = np.interp(ref_frame, take.warp_ref_frames, take.warp_take_frames)
         return take_frame * hop_length / self.sr
 
     def get_segment_audio(self, take_idx: int, segment: Segment,
@@ -390,6 +393,18 @@ class Project:
             self.issues.extend(seg_issues)
 
         self._print_diagnosis()
+        self._mark_false_starts()
+
+    def _mark_false_starts(self):
+        """Mark false start segments as cut, so they're excluded from the composite."""
+        false_start_indices = {i.segment_index for i in self.issues
+                               if i.issue_type == "false_start"}
+        for seg in self.segments:
+            seg.cut = seg.index in false_start_indices
+        if false_start_indices:
+            labels = [self.segments[i].label for i in sorted(false_start_indices)]
+            print(f"  Marked {len(false_start_indices)} segment(s) as cut (false starts): "
+                  + ", ".join(labels))
 
     def _find_best_donor(self, segment: Segment) -> int:
         """Find the donor take with fewest problems for this segment."""
@@ -526,8 +541,7 @@ class Project:
         doesn't exist in donor takes. This method re-runs DTW with the false
         start frames excluded, giving accurate alignment for surrounding segments.
         """
-        false_start_segs = [seg for seg in self.segments
-                            if self._is_false_start_segment(seg.index)]
+        false_start_segs = [seg for seg in self.segments if seg.cut]
         if not false_start_segs:
             return  # No false starts, alignment is fine
 
@@ -577,46 +591,13 @@ class Project:
         crossfade_samples = int(crossfade_ms / 1000 * self.sr)
 
         patched_indices = {p.segment_index: p.take_index for p in self.patches}
-        # Cut false_start segments only if they have no patch (or patch is
-        # the auto-generated one from the false_start issue itself).
-        # If the user explicitly patches a false_start segment with a donor,
-        # use the donor audio instead of cutting.
-        false_start_segs = {i.segment_index for i in self.issues if i.issue_type == "false_start"}
-        cut_indices = set()
-        for seg_idx in false_start_segs:
-            if seg_idx not in patched_indices:
-                # Not patched at all — cut it
-                cut_indices.add(seg_idx)
-            else:
-                # Check if the patch was auto-generated from the false_start
-                patch = next(p for p in self.patches if p.segment_index == seg_idx)
-                if "false_start" in patch.reason:
-                    cut_indices.add(seg_idx)
-                # Otherwise it's a manual/different patch — use donor audio
+        cut_indices = {seg.index for seg in self.segments if seg.cut}
 
         # Build output as contiguous runs. Consecutive segments from the
         # same source (base, or same donor take) are merged into one run
         # with no crossfade. Crossfades only happen where the source changes.
 
-        # Each run: (source_id, audio_chunks_list)
-        # source_id: 'base', 'cut', or donor take index
         runs = []  # list of (source_id, np.ndarray or None)
-        current_source = None
-        current_chunks = []
-        base_run_start = None
-
-        def flush_base_run(up_to_sample):
-            nonlocal base_run_start
-            if base_run_start is not None:
-                current_chunks.append(base.audio[base_run_start:up_to_sample].copy())
-                base_run_start = None
-
-        def flush_current_run():
-            nonlocal current_source, current_chunks
-            if current_chunks:
-                runs.append((current_source, np.concatenate(current_chunks)))
-            current_source = None
-            current_chunks = []
 
         # First pass: group consecutive segments by source
         groups = []  # list of (source, [seg, seg, ...])

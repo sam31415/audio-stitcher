@@ -75,6 +75,7 @@ def get_project():
             "issues": seg_issues,
             "max_severity": float(max_severity),
             "patch": patch,
+            "cut": seg.cut,
         })
 
     takes = [{"index": i, "name": t.name, "duration": float(t.duration),
@@ -116,6 +117,64 @@ def get_full_take(take_idx):
     sf.write(buf, take.audio, take.sr, format='WAV')
     buf.seek(0)
     return send_file(buf, mimetype='audio/wav')
+
+
+@app.route("/api/audio/range/<int:start_seg>/<int:end_seg>/<int:take_idx>")
+def get_range_audio(start_seg, end_seg, take_idx):
+    """Serve audio for a contiguous range of segments from a take."""
+    segs = [s for s in proj.segments if start_seg <= s.index <= end_seg]
+    if not segs:
+        return "No segments", 404
+
+    if take_idx == proj.base_idx:
+        # Direct extraction from base
+        start_sample = int(segs[0].start_time * proj.sr)
+        end_sample = min(int(segs[-1].end_time * proj.sr), len(proj.takes[proj.base_idx].audio))
+        audio = proj.takes[proj.base_idx].audio[start_sample:end_sample].copy()
+    else:
+        # Extract contiguous block from donor using DTW endpoints
+        take = proj.takes[take_idx]
+        donor_start = proj._base_time_to_take_time(take, segs[0].start_time)
+        donor_end = proj._base_time_to_take_time(take, segs[-1].end_time)
+        start_sample = max(0, int(donor_start * proj.sr))
+        end_sample = min(len(take.audio), int(donor_end * proj.sr))
+        if start_sample >= end_sample:
+            audio = np.zeros(1000, dtype=np.float32)
+        else:
+            audio = take.audio[start_sample:end_sample].copy()
+            # Volume-match to base span
+            base_start = int(segs[0].start_time * proj.sr)
+            base_end = min(int(segs[-1].end_time * proj.sr), len(proj.takes[proj.base_idx].audio))
+            base_span = proj.takes[proj.base_idx].audio[base_start:base_end]
+            base_rms = np.sqrt(np.mean(base_span**2)) + 1e-8
+            donor_rms = np.sqrt(np.mean(audio**2)) + 1e-8
+            audio = audio * (base_rms / donor_rms)
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, proj.sr, format='WAV')
+    buf.seek(0)
+    return send_file(buf, mimetype='audio/wav')
+
+
+@app.route("/api/patch_range", methods=["POST"])
+def set_patch_range():
+    """Add or remove patches for a range of segments."""
+    data = request.json
+    start_seg = data["start_segment"]
+    end_seg = data["end_segment"]
+    # Skip cut segments (false starts)
+    cut_indices = {s.index for s in proj.segments if s.cut}
+    if data.get("remove"):
+        for idx in range(start_seg, end_seg + 1):
+            if idx not in cut_indices:
+                proj.remove_patch(idx)
+    else:
+        take_idx = data["take_index"]
+        reason = data.get("reason", "manual (range)")
+        for idx in range(start_seg, end_seg + 1):
+            if idx not in cut_indices:
+                proj.add_patch(idx, take_idx, reason)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/patch", methods=["POST"])
