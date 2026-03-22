@@ -134,8 +134,8 @@ def get_range_audio(start_seg, end_seg, take_idx):
     else:
         # Extract contiguous block from donor using DTW endpoints
         take = proj.takes[take_idx]
-        donor_start = proj._base_time_to_take_time(take, segs[0].start_time)
-        donor_end = proj._base_time_to_take_time(take, segs[-1].end_time)
+        donor_start = proj._refine_donor_boundary(take, segs[0].start_time)
+        donor_end = proj._refine_donor_boundary(take, segs[-1].end_time)
         start_sample = max(0, int(donor_start * proj.sr))
         end_sample = min(len(take.audio), int(donor_end * proj.sr))
         if start_sample >= end_sample:
@@ -175,6 +175,16 @@ def set_patch_range():
             if idx not in cut_indices:
                 proj.add_patch(idx, take_idx, reason)
     return jsonify({"ok": True})
+
+
+@app.route("/api/cut", methods=["POST"])
+def toggle_cut():
+    """Toggle a segment's cut flag."""
+    data = request.json
+    seg_idx = data["segment_index"]
+    seg = proj.segments[seg_idx]
+    seg.cut = data.get("cut", not seg.cut)
+    return jsonify({"ok": True, "cut": seg.cut})
 
 
 @app.route("/api/patch", methods=["POST"])

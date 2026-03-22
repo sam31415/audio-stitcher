@@ -330,14 +330,39 @@ function renderDetail() {
   // Take grid — only for non-cut segments
   const container = document.getElementById('take-grid-container');
   const patchableSegs = segs.filter(s => !s.cut);
+  // Show cut toggle for any segment that is cut or has a false_start issue
+  const cutSegs = segs.filter(s => s.cut);
+  const falseStartSegs = segs.filter(s => s.issues.some(i => i.type === 'false_start'));
+  if (cutSegs.length > 0 || falseStartSegs.length > 0) {
+    const cutIndices = [...new Set([...cutSegs, ...falseStartSegs].map(s => s.index))];
+    let cutHtml = '<div style="margin-top:12px;margin-bottom:12px">';
+    cutIndices.forEach(idx => {
+      const s = project.segments.find(x => x.index === idx);
+      const label = isRange ? `${s.label}: ` : '';
+      if (s.cut) {
+        cutHtml += `<div style="color:#9c27b0;font-size:13px;display:flex;align-items:center;gap:8px;margin-bottom:4px">` +
+          `<span>${label}Marked as false start (will be cut)</span>` +
+          `<button class="btn-secondary btn-sm" onclick="toggleCut(${idx}, false)">Restore segment</button></div>`;
+      } else {
+        cutHtml += `<div style="color:#888;font-size:13px;display:flex;align-items:center;gap:8px;margin-bottom:4px">` +
+          `<span>${label}Detected as false start (kept)</span>` +
+          `<button class="btn-danger btn-sm" onclick="toggleCut(${idx}, true)">Cut segment</button></div>`;
+      }
+    });
+    cutHtml += '</div>';
+    container.innerHTML = cutHtml;
+  } else {
+    container.innerHTML = '';
+  }
+
   if (patchableSegs.length === 0) {
-    container.innerHTML = '<div style="color:#9c27b0;font-size:13px;margin-top:12px">' +
-      'This segment is a false start and will be cut from the composite.</div>';
+    // No take grid needed — all segments are cut
+    return;
   } else {
     // For range patching, use the full range but patching only applies to non-cut segments
     const pStart = patchableSegs[0].index;
     const pEnd = patchableSegs[patchableSegs.length - 1].index;
-    container.innerHTML = '<div class="take-grid">' + project.takes.map(take => {
+    container.innerHTML += '<div class="take-grid">' + project.takes.map(take => {
       const isBase = take.is_base;
       const allUseThis = patchableSegs.every(s =>
         (take.index === project.base_idx && !s.patch) ||
@@ -364,6 +389,18 @@ function renderDetail() {
       </div>`;
     }).join('') + '</div>';
   }
+}
+
+// --- Cut toggle ---
+async function toggleCut(segIdx, cut) {
+  await fetch('/api/cut', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({segment_index: segIdx, cut: cut}),
+  });
+  invalidateFullAudio();
+  await loadProject();
+  renderDetail();
 }
 
 // --- Audio preview (single segment or range) ---

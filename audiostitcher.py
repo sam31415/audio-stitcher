@@ -181,6 +181,47 @@ class Project:
         take_frame = np.interp(ref_frame, take.warp_ref_frames, take.warp_take_frames)
         return take_frame * hop_length / self.sr
 
+    def _refine_donor_boundary(self, take: Take, base_time: float,
+                               search_ms: float = 80) -> float:
+        """Refine a DTW-mapped donor time using cross-correlation with base audio.
+
+        Takes a short window of base audio around the boundary and finds the
+        best-matching position in the donor within a search range. This gives
+        sample-accurate alignment, locking onto note attacks/transients.
+        """
+        approx_donor_time = self._base_time_to_take_time(take, base_time)
+        base = self.takes[self.base_idx]
+
+        ref_half = int(0.03 * self.sr)   # 30ms half-window for reference
+        search_half = int(search_ms / 1000 * self.sr)
+
+        # Reference window from base centered on boundary
+        base_sample = int(base_time * self.sr)
+        ref_start = max(0, base_sample - ref_half)
+        ref_end = min(len(base.audio), base_sample + ref_half)
+        ref = base.audio[ref_start:ref_end]
+
+        if len(ref) < ref_half:
+            return approx_donor_time
+
+        # Search window from donor around DTW estimate
+        donor_sample = int(approx_donor_time * self.sr)
+        search_start = max(0, donor_sample - search_half)
+        search_end = min(len(take.audio), donor_sample + search_half)
+        search = take.audio[search_start:search_end]
+
+        if len(search) <= len(ref):
+            return approx_donor_time
+
+        # Cross-correlation: find where ref best matches within search
+        corr = np.correlate(search, ref, mode='valid')
+        best_offset = np.argmax(np.abs(corr))
+
+        # The match starts at search_start + best_offset in the donor.
+        # The boundary corresponds to ref_half into the reference window.
+        refined_sample = search_start + best_offset + (base_sample - ref_start)
+        return refined_sample / self.sr
+
     def get_segment_audio(self, take_idx: int, segment: Segment,
                           match_duration: bool = True) -> np.ndarray:
         """Extract audio for a segment from a take.
@@ -204,9 +245,9 @@ class Project:
                 return np.zeros(target_samples, dtype=np.float32)
             return take.audio[start_sample:end_sample].copy()
 
-        # For donor takes: use DTW to find corresponding time range
-        start = self._base_time_to_take_time(take, segment.start_time)
-        end = self._base_time_to_take_time(take, segment.end_time)
+        # For donor takes: use cross-correlation-refined boundaries
+        start = self._refine_donor_boundary(take, segment.start_time)
+        end = self._refine_donor_boundary(take, segment.end_time)
 
         start_sample = max(0, int(start * self.sr))
         end_sample = min(len(take.audio), int(end * self.sr))
@@ -583,7 +624,12 @@ class Project:
         """Export the composite: base take with patches applied.
 
         False start patches are cut out entirely. Regular patches replace
-        the base audio with time-stretched, volume-matched donor audio.
+        the base audio with volume-matched donor audio.
+
+        Crossfades happen in the pre-boundary sustain zone: the incoming
+        source provides a short pre-roll before the segment boundary, which
+        is blended with the outgoing source's tail. This ensures note attacks
+        at segment boundaries come through cleanly without doubling.
 
         Returns the composite audio array. If output_path is given, also writes to file.
         """
@@ -593,13 +639,7 @@ class Project:
         patched_indices = {p.segment_index: p.take_index for p in self.patches}
         cut_indices = {seg.index for seg in self.segments if seg.cut}
 
-        # Build output as contiguous runs. Consecutive segments from the
-        # same source (base, or same donor take) are merged into one run
-        # with no crossfade. Crossfades only happen where the source changes.
-
-        runs = []  # list of (source_id, np.ndarray or None)
-
-        # First pass: group consecutive segments by source
+        # Group consecutive segments by source
         groups = []  # list of (source, [seg, seg, ...])
         for seg in self.segments:
             if seg.index in cut_indices:
@@ -616,65 +656,99 @@ class Project:
                 else:
                     groups.append(('base', [seg]))
 
-        # Second pass: extract audio for each group
+        # Extract audio for each group: core (exact segment range) + pre-roll
+        # for crossfading. The pre-roll comes from the INCOMING source and
+        # covers the sustain zone just before the boundary, so the crossfade
+        # blends two versions of the same pre-boundary region rather than
+        # mixing post-boundary with pre-boundary audio (which causes doubled
+        # note attacks).
+        runs = []  # list of (source, core_audio, preroll_audio_or_None)
+
+        non_cut_count = 0
         for source, segs in groups:
             if source == 'cut':
-                runs.append(('cut', None))
+                runs.append(('cut', None, None))
                 continue
 
-            if source == 'base':
-                start_sample = int(segs[0].start_time * self.sr)
-                end_sample = int(segs[-1].end_time * self.sr)
-                end_sample = min(end_sample, len(base.audio))
-                runs.append(('base', base.audio[start_sample:end_sample].copy()))
+            first_start = segs[0].start_time
+            last_end = segs[-1].end_time
+            need_preroll = non_cut_count > 0
 
+            if source == 'base':
+                s = max(0, int(first_start * self.sr))
+                e = min(len(base.audio), int(last_end * self.sr))
+                core = base.audio[s:e].copy()
+
+                preroll = None
+                if need_preroll:
+                    ps = max(0, s - crossfade_samples)
+                    preroll = base.audio[ps:s].copy()
+
+                runs.append(('base', core, preroll))
             else:
-                # Donor: extract as one contiguous block using DTW endpoints
                 donor_idx = source
                 take = self.takes[donor_idx]
-                first_seg = segs[0]
-                last_seg = segs[-1]
+                donor_start = self._refine_donor_boundary(take, first_start)
+                donor_end = self._refine_donor_boundary(take, last_end)
+                cs = max(0, int(donor_start * self.sr))
+                ce = min(len(take.audio), int(donor_end * self.sr))
 
-                donor_start = self._base_time_to_take_time(take, first_seg.start_time)
-                donor_end = self._base_time_to_take_time(take, last_seg.end_time)
+                if cs < ce:
+                    core = take.audio[cs:ce].copy()
 
-                start_sample = max(0, int(donor_start * self.sr))
-                end_sample = min(len(take.audio), int(donor_end * self.sr))
+                    # Volume-match to base
+                    bs = int(first_start * self.sr)
+                    be = min(int(last_end * self.sr), len(base.audio))
+                    base_rms = np.sqrt(np.mean(base.audio[bs:be]**2)) + 1e-8
+                    core_rms = np.sqrt(np.mean(core**2)) + 1e-8
+                    gain = base_rms / core_rms
+                    core *= gain
 
-                if start_sample < end_sample:
-                    chunk = take.audio[start_sample:end_sample].copy()
+                    preroll = None
+                    if need_preroll:
+                        pre_time = max(0, first_start - crossfade_samples / self.sr)
+                        donor_pre = self._refine_donor_boundary(take, pre_time)
+                        ps = max(0, int(donor_pre * self.sr))
+                        preroll = take.audio[ps:cs].copy() * gain
 
-                    # Volume-match to corresponding base span
-                    base_start = int(first_seg.start_time * self.sr)
-                    base_end = int(last_seg.end_time * self.sr)
-                    base_end = min(base_end, len(base.audio))
-                    base_span = base.audio[base_start:base_end]
-                    base_rms = np.sqrt(np.mean(base_span**2)) + 1e-8
-                    chunk_rms = np.sqrt(np.mean(chunk**2)) + 1e-8
-                    chunk = chunk * (base_rms / chunk_rms)
-
-                    runs.append((donor_idx, chunk))
+                    runs.append((donor_idx, core, preroll))
                 else:
-                    runs.append((donor_idx, np.zeros(0, dtype=np.float32)))
+                    runs.append((donor_idx, np.zeros(0, dtype=np.float32), None))
 
-        # Concatenate runs, crossfading only at boundaries between runs
-        audio_runs = [r[1] for r in runs if r[0] != 'cut' and r[1] is not None]
+            non_cut_count += 1
 
-        if not audio_runs:
+        # Concatenate runs with pre-boundary crossfades
+        active = [(s, c, p) for s, c, p in runs
+                   if s != 'cut' and c is not None and len(c) > 0]
+
+        if not active:
             output = np.zeros(0, dtype=np.float32)
         else:
-            output = audio_runs[0]
-            for i in range(1, len(audio_runs)):
-                chunk = audio_runs[i]
-                cf = min(crossfade_samples, len(output), len(chunk))
-                if cf > 1:
-                    t = np.linspace(0, np.pi / 2, cf, dtype=np.float32)
-                    fade_out = np.cos(t)
-                    fade_in = np.sin(t)
-                    output[-cf:] = output[-cf:] * fade_out + chunk[:cf] * fade_in
-                    output = np.concatenate([output, chunk[cf:]])
+            output = active[0][1]
+            for i in range(1, len(active)):
+                _, core, preroll = active[i]
+
+                if preroll is not None and len(preroll) > 0:
+                    # Crossfade in the pre-boundary sustain zone
+                    cf = min(len(preroll), len(output))
+                    if cf > 1:
+                        pr = preroll[-cf:] if len(preroll) > cf else preroll
+                        cf = len(pr)
+
+                        t = np.linspace(0, np.pi / 2, cf, dtype=np.float32)
+                        fade_out = np.cos(t)
+                        fade_in = np.sin(t)
+
+                        # Both output[-cf:] and pr cover the same pre-boundary
+                        # time region, so the crossfade blends sustain with
+                        # sustain. The core starts at the boundary with its
+                        # note attack fully preserved.
+                        output[-cf:] = output[-cf:] * fade_out + pr * fade_in
+                        output = np.concatenate([output, core])
+                    else:
+                        output = np.concatenate([output, core])
                 else:
-                    output = np.concatenate([output, chunk])
+                    output = np.concatenate([output, core])
 
         peak = np.max(np.abs(output)) if len(output) > 0 else 0
         if peak > 0.95:
