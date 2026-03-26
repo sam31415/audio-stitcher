@@ -160,6 +160,7 @@ h1 { padding: 16px 24px 8px; font-size: 20px; color: #fff; }
     <span class="time" id="detail-time"></span>
   </div>
   <div class="issues-list" id="issues-list"></div>
+  <div id="speed-control" style="display:none;margin-bottom:12px"></div>
   <div id="take-grid-container"></div>
 </div>
 
@@ -327,6 +328,28 @@ function renderDetail() {
     }).join('');
   }
 
+  // Speed control
+  const speedEl = document.getElementById('speed-control');
+  const nonCutSegs = segs.filter(s => !s.cut);
+  if (nonCutSegs.length > 0) {
+    const speeds = nonCutSegs.map(s => s.speed_adjust || 0);
+    const allSame = speeds.every(v => v === speeds[0]);
+    const currentSpeed = allSame ? speeds[0] : null;
+    const displayVal = currentSpeed !== null ? (currentSpeed > 0 ? '+' : '') + currentSpeed.toFixed(1) + '%' : 'mixed';
+    speedEl.style.display = 'flex';
+    speedEl.style.alignItems = 'center';
+    speedEl.style.gap = '8px';
+    speedEl.style.fontSize = '13px';
+    speedEl.innerHTML =
+      `<span style="color:#aaa">Speed:</span>` +
+      `<button class="btn-secondary btn-sm" onclick="adjustSpeed(${rStart}, ${rEnd}, -1)">-1%</button>` +
+      `<span style="min-width:50px;text-align:center;font-weight:600;color:${currentSpeed === 0 || currentSpeed === null ? '#888' : '#4a7fff'}">${displayVal}</span>` +
+      `<button class="btn-secondary btn-sm" onclick="adjustSpeed(${rStart}, ${rEnd}, +1)">+1%</button>` +
+      (currentSpeed !== 0 ? `<button class="btn-secondary btn-sm" onclick="setSpeed(${rStart}, ${rEnd}, 0)">Reset</button>` : '');
+  } else {
+    speedEl.style.display = 'none';
+  }
+
   // Take grid — only for non-cut segments
   const container = document.getElementById('take-grid-container');
   const patchableSegs = segs.filter(s => !s.cut);
@@ -397,6 +420,26 @@ async function toggleCut(segIdx, cut) {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({segment_index: segIdx, cut: cut}),
+  });
+  invalidateFullAudio();
+  await loadProject();
+  renderDetail();
+}
+
+// --- Speed adjustment ---
+async function adjustSpeed(startSeg, endSeg, delta) {
+  // Get current speed from the first non-cut segment in range
+  const segs = project.segments.filter(s => s.index >= startSeg && s.index <= endSeg && !s.cut);
+  if (!segs.length) return;
+  const current = segs[0].speed_adjust || 0;
+  await setSpeed(startSeg, endSeg, current + delta);
+}
+
+async function setSpeed(startSeg, endSeg, speed) {
+  await fetch('/api/speed', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({start_segment: startSeg, end_segment: endSeg, speed: speed}),
   });
   invalidateFullAudio();
   await loadProject();

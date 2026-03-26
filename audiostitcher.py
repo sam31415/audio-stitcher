@@ -71,6 +71,7 @@ class Project:
         self.patches: list[Patch] = []  # only segments that differ from base
         self.issues: list[Issue] = []  # detected problems in base take
         self.base_idx: int = 0
+        self.speed_adjustments: dict[int, float] = {}  # segment_index -> percent change (e.g. -2.0 = 2% slower)
 
     def load_takes(self, min_duration: float = 30.0):
         """Load all WAV files from the project folder."""
@@ -268,6 +269,12 @@ class Project:
                     audio = audio[:target_samples]
                 elif len(audio) < target_samples:
                     audio = np.pad(audio, (0, target_samples - len(audio)))
+
+        # Apply manual speed adjustment if set
+        speed_pct = self.speed_adjustments.get(segment.index, 0.0)
+        if speed_pct != 0.0 and len(audio) > 0:
+            rate = 1.0 + speed_pct / 100.0
+            audio = librosa.effects.time_stretch(audio, rate=rate)
 
         return audio
 
@@ -620,6 +627,37 @@ class Project:
             mean_cost = D[wp[-1, 0], wp[-1, 1]] / len(wp)
             print(f"  {take.name}: {len(wp)} warping points, mean DTW cost={mean_cost:.4f}")
 
+    def _apply_group_speed(self, audio: np.ndarray, segs: list) -> np.ndarray:
+        """Apply per-segment speed adjustments to a contiguous audio block.
+
+        If all segments in the group share the same adjustment, stretches the
+        whole block at once. Otherwise stretches each segment's portion
+        individually and concatenates.
+        """
+        adjustments = [self.speed_adjustments.get(s.index, 0.0) for s in segs]
+        if all(a == 0.0 for a in adjustments):
+            return audio
+
+        # Check if uniform adjustment across the group
+        if len(set(adjustments)) == 1:
+            rate = 1.0 + adjustments[0] / 100.0
+            return librosa.effects.time_stretch(audio, rate=rate)
+
+        # Non-uniform: split audio proportionally by segment duration and stretch each
+        total_dur = segs[-1].end_time - segs[0].start_time
+        parts = []
+        pos = 0
+        for seg, adj in zip(segs, adjustments):
+            seg_dur = seg.end_time - seg.start_time
+            n_samples = int(len(audio) * seg_dur / total_dur)
+            chunk = audio[pos:pos + n_samples]
+            pos += n_samples
+            if adj != 0.0 and len(chunk) > 0:
+                rate = 1.0 + adj / 100.0
+                chunk = librosa.effects.time_stretch(chunk, rate=rate)
+            parts.append(chunk)
+        return np.concatenate(parts) if parts else audio
+
     def export_composite(self, output_path: str = None, crossfade_ms: int = 50) -> np.ndarray:
         """Export the composite: base take with patches applied.
 
@@ -679,6 +717,9 @@ class Project:
                 e = min(len(base.audio), int(last_end * self.sr))
                 core = base.audio[s:e].copy()
 
+                # Apply per-segment speed adjustments
+                core = self._apply_group_speed(core, segs)
+
                 preroll = None
                 if need_preroll:
                     ps = max(0, s - crossfade_samples)
@@ -696,6 +737,19 @@ class Project:
                 if cs < ce:
                     core = take.audio[cs:ce].copy()
 
+                    # Time-stretch donor to match base duration so patched
+                    # sections don't play faster/slower than surrounding base
+                    target_duration = last_end - first_start
+                    donor_duration = len(core) / self.sr
+                    if abs(donor_duration - target_duration) > 0.02:
+                        stretch_rate = donor_duration / target_duration
+                        core = librosa.effects.time_stretch(core, rate=stretch_rate)
+                        target_samples = int(target_duration * self.sr)
+                        if len(core) > target_samples:
+                            core = core[:target_samples]
+                        elif len(core) < target_samples:
+                            core = np.pad(core, (0, target_samples - len(core)))
+
                     # Volume-match to base
                     bs = int(first_start * self.sr)
                     be = min(int(last_end * self.sr), len(base.audio))
@@ -703,6 +757,9 @@ class Project:
                     core_rms = np.sqrt(np.mean(core**2)) + 1e-8
                     gain = base_rms / core_rms
                     core *= gain
+
+                    # Apply per-segment speed adjustments
+                    core = self._apply_group_speed(core, segs)
 
                     preroll = None
                     if need_preroll:
@@ -802,6 +859,7 @@ class Project:
             "patches": [{"segment": p.segment_index, "take": p.take_index,
                           "reason": p.reason}
                          for p in self.patches],
+            "speed_adjustments": {str(k): v for k, v in self.speed_adjustments.items()},
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
@@ -816,6 +874,7 @@ class Project:
                          for s in data["segments"]]
         self.patches = [Patch(p["segment"], p["take"], p.get("reason", ""))
                         for p in data["patches"]]
+        self.speed_adjustments = {int(k): v for k, v in data.get("speed_adjustments", {}).items()}
         print(f"Session loaded from {path}")
 
 

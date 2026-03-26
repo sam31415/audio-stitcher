@@ -76,6 +76,7 @@ def get_project():
             "max_severity": float(max_severity),
             "patch": patch,
             "cut": seg.cut,
+            "speed_adjust": proj.speed_adjustments.get(seg.index, 0.0),
         })
 
     takes = [{"index": i, "name": t.name, "duration": float(t.duration),
@@ -142,6 +143,18 @@ def get_range_audio(start_seg, end_seg, take_idx):
             audio = np.zeros(1000, dtype=np.float32)
         else:
             audio = take.audio[start_sample:end_sample].copy()
+            # Time-stretch to match base duration
+            target_duration = segs[-1].end_time - segs[0].start_time
+            donor_duration = len(audio) / proj.sr
+            if abs(donor_duration - target_duration) > 0.02:
+                stretch_rate = donor_duration / target_duration
+                import librosa
+                audio = librosa.effects.time_stretch(audio, rate=stretch_rate)
+                target_samples = int(target_duration * proj.sr)
+                if len(audio) > target_samples:
+                    audio = audio[:target_samples]
+                elif len(audio) < target_samples:
+                    audio = np.pad(audio, (0, target_samples - len(audio)))
             # Volume-match to base span
             base_start = int(segs[0].start_time * proj.sr)
             base_end = min(int(segs[-1].end_time * proj.sr), len(proj.takes[proj.base_idx].audio))
@@ -185,6 +198,24 @@ def toggle_cut():
     seg = proj.segments[seg_idx]
     seg.cut = data.get("cut", not seg.cut)
     return jsonify({"ok": True, "cut": seg.cut})
+
+
+@app.route("/api/speed", methods=["POST"])
+def set_speed():
+    """Set speed adjustment for a range of segments."""
+    data = request.json
+    start_seg = data["start_segment"]
+    end_seg = data["end_segment"]
+    speed_pct = float(data["speed"])  # percent change, e.g. -2.0 = 2% slower
+    for idx in range(start_seg, end_seg + 1):
+        seg = proj.segments[idx]
+        if seg.cut:
+            continue
+        if speed_pct == 0.0:
+            proj.speed_adjustments.pop(idx, None)
+        else:
+            proj.speed_adjustments[idx] = speed_pct
+    return jsonify({"ok": True})
 
 
 @app.route("/api/patch", methods=["POST"])
