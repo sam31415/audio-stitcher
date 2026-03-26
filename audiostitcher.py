@@ -72,6 +72,7 @@ class Project:
         self.issues: list[Issue] = []  # detected problems in base take
         self.base_idx: int = 0
         self.speed_adjustments: dict[int, float] = {}  # segment_index -> percent change (e.g. -2.0 = 2% slower)
+        self.time_stretch_donors: bool = True  # whether to time-stretch donor audio to match base tempo
 
     def load_takes(self, min_duration: float = 30.0):
         """Load all WAV files from the project folder."""
@@ -259,7 +260,7 @@ class Project:
         audio = take.audio[start_sample:end_sample].copy()
 
         # Time-stretch to match base segment duration
-        if match_duration and len(audio) > 0:
+        if match_duration and self.time_stretch_donors and len(audio) > 0:
             donor_duration = len(audio) / self.sr
             if abs(donor_duration - target_duration) > 0.02:
                 stretch_rate = donor_duration / target_duration
@@ -737,18 +738,18 @@ class Project:
                 if cs < ce:
                     core = take.audio[cs:ce].copy()
 
-                    # Time-stretch donor to match base duration so patched
-                    # sections don't play faster/slower than surrounding base
-                    target_duration = last_end - first_start
-                    donor_duration = len(core) / self.sr
-                    if abs(donor_duration - target_duration) > 0.02:
-                        stretch_rate = donor_duration / target_duration
-                        core = librosa.effects.time_stretch(core, rate=stretch_rate)
-                        target_samples = int(target_duration * self.sr)
-                        if len(core) > target_samples:
-                            core = core[:target_samples]
-                        elif len(core) < target_samples:
-                            core = np.pad(core, (0, target_samples - len(core)))
+                    # Time-stretch donor to match base duration (optional)
+                    if self.time_stretch_donors:
+                        target_duration = last_end - first_start
+                        donor_duration = len(core) / self.sr
+                        if abs(donor_duration - target_duration) > 0.02:
+                            stretch_rate = donor_duration / target_duration
+                            core = librosa.effects.time_stretch(core, rate=stretch_rate)
+                            target_samples = int(target_duration * self.sr)
+                            if len(core) > target_samples:
+                                core = core[:target_samples]
+                            elif len(core) < target_samples:
+                                core = np.pad(core, (0, target_samples - len(core)))
 
                     # Volume-match to base
                     bs = int(first_start * self.sr)

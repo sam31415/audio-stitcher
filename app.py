@@ -88,6 +88,7 @@ def get_project():
         "base_idx": proj.base_idx,
         "segments": segments,
         "total_duration": float(proj.takes[proj.base_idx].duration),
+        "time_stretch_donors": proj.time_stretch_donors,
     })
 
 
@@ -143,10 +144,10 @@ def get_range_audio(start_seg, end_seg, take_idx):
             audio = np.zeros(1000, dtype=np.float32)
         else:
             audio = take.audio[start_sample:end_sample].copy()
-            # Time-stretch to match base duration
+            # Time-stretch to match base duration (if enabled)
             target_duration = segs[-1].end_time - segs[0].start_time
             donor_duration = len(audio) / proj.sr
-            if abs(donor_duration - target_duration) > 0.02:
+            if proj.time_stretch_donors and abs(donor_duration - target_duration) > 0.02:
                 stretch_rate = donor_duration / target_duration
                 import librosa
                 audio = librosa.effects.time_stretch(audio, rate=stretch_rate)
@@ -198,6 +199,50 @@ def toggle_cut():
     seg = proj.segments[seg_idx]
     seg.cut = data.get("cut", not seg.cut)
     return jsonify({"ok": True, "cut": seg.cut})
+
+
+@app.route("/api/donor_timing/<int:start_seg>/<int:end_seg>/<int:take_idx>")
+def get_donor_timing(start_seg, end_seg, take_idx):
+    """Return donor timing info for diagnostics."""
+    segs = [s for s in proj.segments if start_seg <= s.index <= end_seg]
+    if not segs or take_idx == proj.base_idx:
+        base_dur = segs[-1].end_time - segs[0].start_time if segs else 0
+        return jsonify({"base_duration": base_dur, "donor_duration": base_dur, "stretch_rate": 1.0})
+
+    take = proj.takes[take_idx]
+    donor_start = proj._refine_donor_boundary(take, segs[0].start_time)
+    donor_end = proj._refine_donor_boundary(take, segs[-1].end_time)
+    base_dur = segs[-1].end_time - segs[0].start_time
+    donor_dur = donor_end - donor_start
+    rate = donor_dur / base_dur if base_dur > 0 else 1.0
+
+    # Also show per-segment info
+    per_seg = []
+    for s in segs:
+        ds = proj._refine_donor_boundary(take, s.start_time)
+        de = proj._refine_donor_boundary(take, s.end_time)
+        bd = s.end_time - s.start_time
+        dd = de - ds
+        per_seg.append({
+            "index": s.index, "label": s.label,
+            "base_dur": round(bd, 3), "donor_dur": round(dd, 3),
+            "stretch_rate": round(dd / bd, 3) if bd > 0 else 1.0,
+        })
+
+    return jsonify({
+        "base_duration": round(base_dur, 3),
+        "donor_duration": round(donor_dur, 3),
+        "stretch_rate": round(rate, 3),
+        "segments": per_seg,
+    })
+
+
+@app.route("/api/time_stretch", methods=["POST"])
+def toggle_time_stretch():
+    """Toggle donor time-stretching on/off."""
+    data = request.json
+    proj.time_stretch_donors = bool(data.get("enabled", True))
+    return jsonify({"ok": True, "enabled": proj.time_stretch_donors})
 
 
 @app.route("/api/speed", methods=["POST"])

@@ -145,6 +145,10 @@ h1 { padding: 16px 24px 8px; font-size: 20px; color: #fff; }
   </label>
   <button class="btn-primary" onclick="autoPatch()">Auto-patch</button>
   <button class="btn-secondary" onclick="clearPatches()">Clear all patches</button>
+  <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+    <input type="checkbox" id="time-stretch-toggle" checked onchange="toggleTimeStretch(this.checked)">
+    Time-stretch donors
+  </label>
   <button class="btn-success" onclick="exportComposite()">Export composite</button>
 </div>
 
@@ -189,6 +193,7 @@ async function loadProject() {
   renderTimeline();
   renderInfo();
   renderPlaybackSource();
+  document.getElementById('time-stretch-toggle').checked = project.time_stretch_donors;
 }
 
 function renderInfo() {
@@ -407,10 +412,27 @@ function renderDetail() {
 
       return `<div class="${cls}">
         <span class="take-name">${take.name}${badges}</span>
+        <span class="donor-timing" id="timing-${take.index}" style="color:#666;font-size:11px;min-width:100px"></span>
         <button class="btn-secondary btn-sm" onclick="playRange(${pStart}, ${pEnd}, ${take.index})">Listen</button>
         ${actionBtn}
       </div>`;
     }).join('') + '</div>';
+
+    // Fetch donor timing info for non-base takes
+    project.takes.forEach(async take => {
+      if (take.is_base) return;
+      const el = document.getElementById(`timing-${take.index}`);
+      if (!el) return;
+      try {
+        const resp = await fetch(`/api/donor_timing/${pStart}/${pEnd}/${take.index}`);
+        const info = await resp.json();
+        const pct = ((info.stretch_rate - 1) * 100).toFixed(1);
+        const sign = pct > 0 ? '+' : '';
+        const color = Math.abs(pct) > 3 ? '#d32f2f' : Math.abs(pct) > 1 ? '#b8860b' : '#666';
+        el.style.color = color;
+        el.textContent = `${info.donor_duration.toFixed(2)}s / ${info.base_duration.toFixed(2)}s (${sign}${pct}%)`;
+      } catch(e) {}
+    });
   }
 }
 
@@ -424,6 +446,16 @@ async function toggleCut(segIdx, cut) {
   invalidateFullAudio();
   await loadProject();
   renderDetail();
+}
+
+// --- Time-stretch toggle ---
+async function toggleTimeStretch(enabled) {
+  await fetch('/api/time_stretch', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: enabled}),
+  });
+  invalidateFullAudio();
 }
 
 // --- Speed adjustment ---
